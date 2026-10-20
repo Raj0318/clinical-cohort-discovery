@@ -1,8 +1,31 @@
+# Python
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Data and generated results
+data/*.csv
 outputs/*
 !outputs/.gitkeep
-data/*.csv
-.streamlit/secrets.toml
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Ignore the unrelated nested empty Git metadata folder in the source workspace
+/Noise-robust patient cohort discovery system/

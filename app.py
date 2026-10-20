@@ -1,224 +1,193 @@
-"""
-app.py
-------
-Streamlit UI for the Noise-Robust Clinical Patient Cohort Discovery
-System (Nested DBSCAN + Centroid K-Means).
+"""Clinical Cohort Studio — privacy-conscious exploratory cohort analysis."""
 
-Run with:
-    streamlit run app.py
-"""
+from __future__ import annotations
 
 import io
-import numpy as np
-import pandas as pd
-import streamlit as st
+import re
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
 from matplotlib import colormaps
 
-from src.data_generator import generate_clinical_dataset, FEATURES as DEFAULT_FEATURES
+from src.data_generator import FEATURES as DEFAULT_FEATURES, generate_clinical_dataset
 from src.pipeline import run_pipeline
 
-st.set_page_config(page_title="Clinical Cohort Discovery", layout="wide")
+st.set_page_config(page_title="Cohort Studio | Clinical Discovery", page_icon="◈", layout="wide")
 
-# ----------------------------------------------------------------------
-# Sidebar - data source + algorithm parameters
-# ----------------------------------------------------------------------
-st.sidebar.title("⚙️ Configuration")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+:root { --ink:#e9f1ff; --muted:#8ea2bd; --panel:rgba(15,27,48,.78); --line:rgba(159,190,233,.13); }
+html, body, [class*="css"] { font-family:Manrope, sans-serif; }
+.stApp { color:var(--ink); background:radial-gradient(ellipse at 12% 6%,rgba(26,113,152,.24),transparent 38%),radial-gradient(ellipse at 85% 20%,rgba(108,67,181,.21),transparent 35%),linear-gradient(145deg,#07111f 0%,#0a1425 50%,#11162a 100%); }
+[data-testid="stHeader"] { background:transparent; }
+[data-testid="stSidebar"] { background:rgba(7,15,28,.91); border-right:1px solid var(--line); }
+[data-testid="stMetric"] { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px 18px; }
+[data-testid="stMetricLabel"] { color:var(--muted); }
+.hero { padding:30px 32px; border:1px solid var(--line); border-radius:24px; background:linear-gradient(115deg,rgba(21,48,73,.88),rgba(25,26,52,.77)); box-shadow:0 24px 80px rgba(0,0,0,.2); margin:12px 0 26px; }
+.eyebrow { color:#70e0d0; text-transform:uppercase; letter-spacing:.17em; font:500 11px 'DM Mono',monospace; }
+.hero h1 { font-size:clamp(32px,5vw,54px); line-height:1.07; letter-spacing:-.055em; margin:12px 0; }
+.hero p { color:#a9bbd1; font-size:15px; max-width:730px; margin:0; }
+.section-kicker { color:#70e0d0; font:500 11px 'DM Mono',monospace; text-transform:uppercase; letter-spacing:.15em; }
+div[data-testid="stDataFrame"], .stPlotlyChart { border:1px solid var(--line); border-radius:15px; overflow:hidden; }
+button[kind="primary"] { border-radius:12px; background:linear-gradient(100deg,#14a99a,#5976db); border:0; }
+.fineprint { color:#8092aa; font-size:12px; }
+</style>
+""", unsafe_allow_html=True)
 
-data_source = st.sidebar.radio("Data source", ["Synthetic demo data", "Upload my own CSV"])
 
-if data_source == "Synthetic demo data":
-    st.sidebar.subheader("Synthetic data settings")
-    n_samples = st.sidebar.slider("Number of patients", 200, 3000, 1200, step=100)
-    noise_fraction = st.sidebar.slider("Noise fraction", 0.0, 0.3, 0.08, step=0.01)
-    seed = st.sidebar.number_input("Random seed", value=42, step=1)
-    df = generate_clinical_dataset(n_samples=n_samples, noise_fraction=noise_fraction, random_state=int(seed))
+def safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_") or "method"
+
+
+def csv_safe(frame: pd.DataFrame) -> pd.DataFrame:
+    """Neutralize spreadsheet formula prefixes in untrusted text cells."""
+    safe = frame.copy()
+    for column in safe.select_dtypes(include=["object", "string"]).columns:
+        safe[column] = safe[column].map(
+            lambda value: "'" + value if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+        )
+    return safe
+
+
+st.sidebar.markdown("## ◈ COHORT STUDIO")
+st.sidebar.caption("Clinical discovery workspace · local session")
+source = st.sidebar.radio("DATA SOURCE", ["Synthetic demo", "Upload CSV"], label_visibility="collapsed")
+df: pd.DataFrame | None = None
+features: list[str] = []
+truth_col: str | None = None
+
+if source == "Synthetic demo":
+    n = st.sidebar.slider("Patient records", 200, 3000, 1200, 100)
+    noise = st.sidebar.slider("Injected noise", 0.0, 0.30, 0.08, 0.01)
+    seed = int(st.sidebar.number_input("Reproducibility seed", min_value=0, value=42, step=1))
+    df = generate_clinical_dataset(n_samples=n, noise_fraction=noise, random_state=seed)
     features = DEFAULT_FEATURES
-    true_label_col = "true_cohort_id"
+    truth_col = "true_cohort_id"
 else:
-    uploaded = st.sidebar.file_uploader("Upload patient CSV", type=["csv"])
-    if uploaded is None:
-        st.info("⬅️ Upload a CSV from the sidebar to get started, or switch to synthetic demo data.")
-        st.stop()
-    df = pd.read_csv(uploaded)
-    st.sidebar.subheader("Select numeric feature columns")
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    features = st.sidebar.multiselect("Features to cluster on", numeric_cols, default=numeric_cols)
-    has_truth = st.sidebar.checkbox("I have a ground-truth cohort column (for evaluation only)")
-    true_label_col = None
-    if has_truth:
-        true_label_col = st.sidebar.selectbox("Ground-truth column", df.columns.tolist())
-    if not features:
-        st.warning("Select at least one numeric feature column to continue.")
-        st.stop()
+    upload = st.sidebar.file_uploader("Choose a patient CSV", type=["csv"], help="Processed in this app session. Avoid uploading direct identifiers.")
+    if upload is not None:
+        try:
+            if upload.size > 25 * 1024 * 1024:
+                st.error("This upload exceeds the 25 MB limit.")
+                st.stop()
+            df = pd.read_csv(upload, nrows=15_001)
+            if len(df) > 15_000:
+                st.error("CSV is limited to 15,000 records per run to keep density clustering responsive.")
+                st.stop()
+        except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
+            st.error(f"Could not read this CSV: {exc}")
+            st.stop()
+        numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+        features = st.sidebar.multiselect("Numeric analysis features", numeric, default=numeric[:min(8, len(numeric))])
+        if st.sidebar.checkbox("Include ground truth for evaluation"):
+            truth_col = st.sidebar.selectbox("Ground-truth column", [None, *df.columns.tolist()])
 
-st.sidebar.subheader("Baseline: Plain K-Means")
-kmeans_k = st.sidebar.slider("k (number of clusters)", 2, 10, 5)
-
-st.sidebar.subheader("Baseline: Plain DBSCAN")
-dbscan_eps = st.sidebar.slider("eps", 0.1, 3.0, 0.9, step=0.05)
-dbscan_min_samples = st.sidebar.slider("min_samples", 2, 30, 10)
-
-st.sidebar.subheader("Proposed: Nested DBSCAN + Centroid K-Means")
-with st.sidebar.expander("Stage 1 — coarse DBSCAN (outlier strip)", expanded=False):
-    eps1 = st.slider("eps1", 0.1, 3.0, 0.6, step=0.05, key="eps1")
-    min_samples1 = st.slider("min_samples1", 2, 30, 12, key="ms1")
-with st.sidebar.expander("Stage 2 — fine DBSCAN (cohort discovery)", expanded=False):
-    eps2 = st.slider("eps2", 0.05, 2.0, 0.25, step=0.05, key="eps2")
-    min_samples2 = st.slider("min_samples2", 2, 30, 10, key="ms2")
-pca_components = st.sidebar.slider("PCA components (density view only)", 2, min(len(features), 6), 2)
-noise_std = st.sidebar.slider("Noise rejection strictness (std)", 1.0, 4.0, 2.5, step=0.1,
-                               help="Lower = more points kept as noise. Higher = more points rescued into a cohort.")
-
-run_btn = st.sidebar.button("🚀 Run clustering", type="primary", use_container_width=True)
-
-# ----------------------------------------------------------------------
-# Header
-# ----------------------------------------------------------------------
-st.title("🏥 Noise-Robust Clinical Patient Cohort Discovery")
-st.caption("Nested DBSCAN + Centroid-Initialized K-Means — a noise-robust hybrid clustering pipeline")
-
-with st.expander("ℹ️ How the proposed algorithm works", expanded=False):
-    st.markdown("""
-1. **Standardize** features so BP, Glucose, Age etc. are comparable.
-2. **PCA (density view only)** — DBSCAN struggles in high dimensions (curse of
-   dimensionality), so a low-dimensional PCA projection is used *only* to help
-   DBSCAN judge density correctly. Centroids and final assignment still use
-   all original features, so results stay clinically interpretable.
-3. **Stage 1 — coarse DBSCAN**: strips gross outliers using a wide `eps1`.
-4. **Stage 2 — fine DBSCAN**: run only on Stage-1 survivors with a tighter
-   `eps2`, discovering the fine-grained patient cohorts.
-5. **Centroid K-Means**: the Stage-2 cluster centroids (computed in full
-   feature space) seed a K-Means pass over the *entire* dataset — rescuing
-   borderline noisy points into their correct cohort.
-6. **Noise-robust rejection**: points still far from every centroid
-   (beyond a configurable number of standard deviations) are kept flagged
-   as noise rather than force-fit into a cohort.
-    """)
-
-st.subheader("📋 Data preview")
-st.dataframe(df.head(10), use_container_width=True)
-st.caption(f"{len(df):,} rows × {df.shape[1]} columns")
-
-if not run_btn:
-    st.info("Adjust parameters in the sidebar, then click **🚀 Run clustering**.")
+if df is None:
+    st.markdown('<div class="hero"><div class="eyebrow">EXPLORATORY CLINICAL ANALYTICS</div><h1>Find the signal<br>inside the noise.</h1><p>Discover interpretable patient cohorts with a transparent, density-aware workflow. Start with synthetic data or bring a de-identified CSV.</p></div>', unsafe_allow_html=True)
+    st.info("Choose a data source in the left panel to begin.")
     st.stop()
 
-# ----------------------------------------------------------------------
-# Run pipeline
-# ----------------------------------------------------------------------
-with st.spinner("Running Plain K-Means, Plain DBSCAN, and the Proposed method..."):
-    out = run_pipeline(
-        df=df,
-        features=features,
-        true_label_col=true_label_col,
-        kmeans_k=kmeans_k,
-        dbscan_eps=dbscan_eps,
-        dbscan_min_samples=dbscan_min_samples,
-        nested_eps1=eps1,
-        nested_min_samples1=min_samples1,
-        nested_eps2=eps2,
-        nested_min_samples2=min_samples2,
-        nested_pca_components=pca_components,
-        nested_noise_std=noise_std,
-    )
+if source == "Upload CSV" and not features:
+    st.warning("Select at least one numeric analysis feature to continue.")
+    st.stop()
 
-st.success("Done!")
+st.sidebar.markdown("---")
+st.sidebar.caption("BASELINES")
+kmeans_k = st.sidebar.slider("K-Means cohorts", 2, 10, 5)
+db_eps = st.sidebar.slider("DBSCAN radius", 0.1, 3.0, 0.9, 0.05)
+db_min = st.sidebar.slider("DBSCAN min samples", 2, 30, 10)
+with st.sidebar.expander("PROPOSED · Nested density + centroid refinement"):
+    eps1 = st.slider("Coarse radius", 0.1, 3.0, 0.6, 0.05)
+    min1 = st.slider("Coarse min samples", 2, 30, 12)
+    eps2 = st.slider("Fine radius", 0.05, 2.0, 0.25, 0.05)
+    min2 = st.slider("Fine min samples", 2, 30, 10)
+    pca_n = st.slider("Density projection dimensions", 2, min(max(len(features), 2), 6), 2)
+    reject_std = st.slider("Noise rejection tolerance", 1.0, 4.0, 2.5, 0.1)
+run = st.sidebar.button("Run cohort analysis", type="primary", use_container_width=True)
 
-# ----------------------------------------------------------------------
-# Metrics table
-# ----------------------------------------------------------------------
-st.subheader("📊 Clustering quality comparison")
-st.dataframe(out.metrics_df, use_container_width=True)
-if true_label_col is None:
-    st.caption("No ground-truth column provided — ARI/NMI columns are not applicable (NaN).")
+st.markdown('<div class="hero"><div class="eyebrow">EXPLORATORY CLINICAL ANALYTICS · RESEARCH PROTOTYPE</div><h1>Find the signal<br>inside the noise.</h1><p>Compare density discovery with centroid-based baselines. Inspect each cohort in clinical units, understand the method’s limits, and export a reproducible analysis.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">01 / Dataset snapshot</div>', unsafe_allow_html=True)
+a, b, c = st.columns(3)
+a.metric("Records", f"{len(df):,}")
+b.metric("Selected features", str(len(features)))
+c.metric("Missing feature values", f"{int(df[features].isna().sum().sum()):,}" if features else "—")
+st.dataframe(df.head(8), use_container_width=True, hide_index=True)
+st.caption("Use de-identified data only. This research tool does not provide diagnoses or treatment recommendations.")
 
+with st.expander("Method notes and interpretation"):
+    st.markdown("""
+**Proposed method: nested density discovery with centroid refinement.** Numeric features are median-imputed and standardized. PCA is used only for the two DBSCAN density passes. The surviving density groups seed K-Means in the full standardized feature space; a distance threshold then flags distant assignments as noise. Feature profiles are reported in original units.
 
-def scatter_by_label(ax, X_2d, labels, title):
-    unique_labels = sorted(set(labels))
-    colors = colormaps["tab10"].resampled(max(len(unique_labels), 1))
-    for i, lab in enumerate(unique_labels):
-        mask = labels == lab
-        if lab == -1:
-            ax.scatter(X_2d[mask, 0], X_2d[mask, 1], s=14, c="lightgrey", marker="x",
-                       label="Noise", alpha=0.7)
-        else:
-            ax.scatter(X_2d[mask, 0], X_2d[mask, 1], s=14, c=[colors(i)], marker="o",
-                       label=f"Cohort {lab}", alpha=0.8)
-    ax.set_title(title, fontweight="bold")
-    ax.set_xlabel("PCA-1")
-    ax.set_ylabel("PCA-2")
-    ax.legend(fontsize=7, loc="best")
+This is an experimental unsupervised workflow, not a validated clinical algorithm. PCA can hide structure; DBSCAN is sensitive to parameters; centroid refinement can change density-discovered memberships. Compare baselines, inspect profiles, and validate externally before drawing conclusions. Synthetic demo data is illustrative only.
+""")
 
+if not run:
+    st.info("Tune the parameters, then choose **Run cohort analysis**.")
+    st.stop()
 
-# ----------------------------------------------------------------------
-# Cluster visualizations
-# ----------------------------------------------------------------------
-st.subheader("🗺️ Cluster visualizations (PCA 2D projection)")
+try:
+    with st.spinner("Preparing features and comparing clustering methods…"):
+        out = run_pipeline(df, features, truth_col, kmeans_k, db_eps, db_min,
+                           eps1, min1, eps2, min2, pca_n, reject_std)
+except (ValueError, KeyError, FloatingPointError) as exc:
+    st.error(f"Analysis could not run: {exc}")
+    st.stop()
 
-n_panels = len(out.labels) + (1 if out.true_labels is not None else 0)
-fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
-if n_panels == 1:
-    axes = [axes]
+st.markdown('<div class="section-kicker">02 / Model comparison</div>', unsafe_allow_html=True)
+st.dataframe(out.metrics_df, use_container_width=True, hide_index=True)
+st.caption("Internal scores exclude points labeled noise. Silhouette is higher-is-better; Davies–Bouldin is lower-is-better. Metrics are descriptive, not clinical validation.")
 
-panel_idx = 0
+st.markdown('<div class="section-kicker">03 / Cohort landscape</div>', unsafe_allow_html=True)
+fig, axes = plt.subplots(1, len(out.labels) + (out.true_labels is not None), figsize=(5.2 * (len(out.labels) + (out.true_labels is not None)), 4.5), squeeze=False)
+panels = []
 if out.true_labels is not None:
-    scatter_by_label(axes[panel_idx], out.X_2d, out.true_labels, "Ground Truth")
-    panel_idx += 1
-for name, lab in out.labels.items():
-    scatter_by_label(axes[panel_idx], out.X_2d, lab, name)
-    panel_idx += 1
-
-plt.tight_layout()
+    panels.append(("Ground truth", out.true_labels))
+panels.extend(out.labels.items())
+for ax, (name, labels) in zip(axes[0], panels):
+    labs = np.asarray(labels)
+    unique = sorted(np.unique(labs).tolist())
+    cmap = colormaps["turbo"].resampled(max(1, len(unique)))
+    for i, lab in enumerate(unique):
+        mask = labs == lab
+        ax.scatter(out.X_2d[mask, 0], out.X_2d[mask, 1], s=11, alpha=.72,
+                   c="#9aa8b8" if lab == -1 else [cmap(i)], marker="x" if lab == -1 else "o",
+                   label="Noise" if lab == -1 else f"Cohort {lab}", linewidths=.6)
+    ax.set_title(name, color="#e9f1ff", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Projection 1", color="#9aabc0"); ax.set_ylabel("Projection 2", color="#9aabc0")
+    ax.set_facecolor("#0b1728"); ax.tick_params(colors="#8497ae", labelsize=8)
+    for edge in ax.spines.values(): edge.set_color("#24354a")
+    ax.legend(fontsize=7, loc="best", frameon=False, labelcolor="#c2d0e0")
+fig.patch.set_facecolor("#0b1422"); fig.tight_layout()
 st.pyplot(fig, use_container_width=True)
+plt.close(fig)
 
-# ----------------------------------------------------------------------
-# Cohort clinical profiles (proposed method)
-# ----------------------------------------------------------------------
-st.subheader("🩺 Discovered cohort clinical profiles (Proposed method)")
-st.caption("Row `-1` = patients flagged as noise/outliers and not assigned to any cohort.")
+st.markdown('<div class="section-kicker">04 / Clinical profile · proposed method</div>', unsafe_allow_html=True)
 st.dataframe(out.cohort_profile_df, use_container_width=True)
+if not out.cohort_profile_df.empty:
+    vals = out.cohort_profile_df[features]
+    z = (vals - vals.mean()) / vals.std(ddof=0).replace(0, 1)
+    fig2, ax2 = plt.subplots(figsize=(min(1.1 * len(features) + 2, 15), max(2.4, .55 * len(z) + 1.2)))
+    im = ax2.imshow(z.fillna(0).values, cmap="coolwarm", aspect="auto", vmin=-2.5, vmax=2.5)
+    ax2.set_xticks(range(len(features)), labels=features, rotation=40, ha="right", color="#c2d0e0")
+    ax2.set_yticks(range(len(z)), labels=["Noise" if x == -1 else f"Cohort {x}" for x in z.index], color="#c2d0e0")
+    ax2.set_facecolor("#0b1728"); fig2.patch.set_facecolor("#0b1422")
+    fig2.colorbar(im, ax=ax2, label="Standardized profile", shrink=.8)
+    fig2.tight_layout(); st.pyplot(fig2, use_container_width=True); plt.close(fig2)
 
-fig2, ax2 = plt.subplots(figsize=(min(1.2 * len(out.features) + 2, 14), 0.6 * len(out.cohort_profile_df) + 2))
-profile_vals = out.cohort_profile_df[out.features]
-z = (profile_vals - profile_vals.mean()) / profile_vals.std().replace(0, 1)
-im = ax2.imshow(z.values, cmap="coolwarm", aspect="auto")
-ax2.set_xticks(range(len(out.features)))
-ax2.set_xticklabels(out.features, rotation=45, ha="right")
-ax2.set_yticks(range(len(out.cohort_profile_df)))
-ax2.set_yticklabels(out.cohort_profile_df.index.tolist())
-ax2.set_ylabel("Cohort ID (-1 = noise)")
-for i in range(z.shape[0]):
-    for j in range(z.shape[1]):
-        ax2.text(j, i, f"{profile_vals.values[i, j]:.1f}", ha="center", va="center", fontsize=8)
-fig2.colorbar(im, ax=ax2, label="Z-score vs other cohorts")
-plt.tight_layout()
-st.pyplot(fig2, use_container_width=True)
-
-# ----------------------------------------------------------------------
-# Downloads
-# ----------------------------------------------------------------------
-st.subheader("⬇️ Downloads")
-col1, col2, col3 = st.columns(3)
-
-result_df = df.copy()
-for name, lab in out.labels.items():
-    result_df[f"cluster__{name.split(':')[0].strip().replace(' ', '_')}"] = lab
-
-with col1:
-    st.download_button("Download clustered dataset (CSV)",
-                        result_df.to_csv(index=False).encode(),
-                        file_name="clustered_patients.csv", mime="text/csv",
-                        use_container_width=True)
-with col2:
-    st.download_button("Download metrics comparison (CSV)",
-                        out.metrics_df.to_csv(index=False).encode(),
-                        file_name="metrics_comparison.csv", mime="text/csv",
-                        use_container_width=True)
-with col3:
-    st.download_button("Download cohort profiles (CSV)",
-                        out.cohort_profile_df.to_csv().encode(),
-                        file_name="cohort_clinical_profiles.csv", mime="text/csv",
-                        use_container_width=True)
+st.markdown('<div class="section-kicker">05 / Export</div>', unsafe_allow_html=True)
+result = df.copy()
+for name, labels in out.labels.items():
+    result[f"cluster__{safe_name(name)}"] = labels
+csv_data = csv_safe(result).to_csv(index=False).encode("utf-8")
+metrics_data = out.metrics_df.to_csv(index=False).encode("utf-8")
+profiles_data = out.cohort_profile_df.to_csv(index=True).encode("utf-8")
+x, y, zcol = st.columns(3)
+x.download_button("Download assignments", csv_data, "cohort_assignments.csv", "text/csv", use_container_width=True)
+y.download_button("Download comparison", metrics_data, "model_comparison.csv", "text/csv", use_container_width=True)
+zcol.download_button("Download profiles", profiles_data, "cohort_profiles.csv", "text/csv", use_container_width=True)
+st.markdown('<p class="fineprint">No patient data is persisted by this app code. Hosting providers, reverse proxies, and uploaded input remain subject to their own logging and retention settings.</p>', unsafe_allow_html=True)

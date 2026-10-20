@@ -1,90 +1,73 @@
-# Noise-Robust Clinical Patient Cohort Discovery (Streamlit App)
-### Nested DBSCAN + Centroid-Initialized K-Means
+# Cohort Studio
 
-An interactive web app that discovers patient cohorts from clinical
-vitals/labs while staying robust to noisy or erroneous records.
+**Noise-aware clinical cohort discovery — an exploratory research prototype.**
 
-## 1. Setup
+Cohort Studio compares K-Means and DBSCAN baselines with a proposed two-pass density discovery and centroid-refinement heuristic. It includes a synthetic demonstration dataset, cohort summaries in original feature units, projection plots, and downloadable analysis outputs.
+
+> **Clinical and privacy boundary:** This software is not a medical device, does not produce diagnoses or treatment recommendations, and has not been clinically validated. Use synthetic or properly de-identified data. Do not upload direct identifiers or protected health information to an unapproved deployment. Hosting, reverse-proxy, and browser infrastructure may retain logs outside this application.
+
+## Run locally
+
+Use Python 3.10 or newer.
+
 ```bash
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 streamlit run app.py
 ```
-This opens the app in your browser (usually `http://localhost:8501`).
 
-## 2. Project Structure
+Open the local URL printed by Streamlit (normally `http://localhost:8501`). Start with synthetic data to explore the workflow. For CSVs, select at least two varying numeric columns. Missing numeric values are median-imputed for analysis; source rows are retained in the assignment export.
+
+## What the proposed method does
+
+1. Median-impute missing and non-finite feature values, remove constant selected columns, and standardize the remaining numeric features.
+2. Project standardized features with PCA for the density passes.
+3. Run a coarse DBSCAN pass, then a finer DBSCAN pass on its non-noise survivors.
+4. Use the fine density groups to seed K-Means in the full standardized feature space.
+5. Flag assignments beyond a cohort-derived distance threshold as noise.
+
+The final labels can differ from the original density memberships because the centroid refinement reassigns points. PCA dimensionality, DBSCAN radii, scale, and cohort shape all affect results. The method is a heuristic, and its output needs independent validation before research or operational use. Internal metrics summarize geometric separation; they do not establish clinical validity or causality.
+
+## Data handling and security
+
+- CSV uploads are limited to 25 MB and 15,000 records to bound interactive density-clustering costs. The app processes data in the current Streamlit session and does not write uploads to disk. Silhouette is sampled for larger datasets.
+- The app code does not persist patient data. This is not an end-to-end privacy guarantee: Streamlit hosting, proxies, observability, backups, and user devices have their own retention and access controls.
+- Do not commit secrets, raw patient exports, or `.streamlit/secrets.toml`. Use the deployment provider's secret store for credentials.
+- CSV downloads are for analysis. Treat exported files as sensitive and store/share them according to your organization's policy.
+- For a real deployment, add identity-aware access control, TLS, audit logging, retention controls, dependency scanning, and an approved data-processing environment before using sensitive data.
+
+## Container deployment
+
+Build and run the non-root container:
+
+```bash
+docker build -t cohort-studio .
+docker run --rm -p 8501:8501 cohort-studio
 ```
-.
-├── app.py                 # Streamlit UI — entry point
-├── src/
-│   ├── data_generator.py  # synthetic clinical dataset (5 cohorts + noise)
-│   ├── clustering.py      # NestedDBSCANCentroidKMeans (core algorithm)
-│   └── pipeline.py        # runs baselines + proposed method, computes metrics
-├── data/                  # (gitignored) place your own CSVs here, or use the built-in generator
-├── outputs/                # (gitignored contents) for anything you export manually
-├── requirements.txt
-└── .gitignore
+
+Set `STREAMLIT_SERVER_ADDRESS=0.0.0.0` and `STREAMLIT_SERVER_PORT=8501` when deploying behind a managed TLS reverse proxy. Keep the application private until authentication and hosting controls meet the needs of your environment. The included container health check verifies the Streamlit health endpoint; it is not a clinical service-level guarantee.
+
+## Project layout
+
+```text
+app.py                  Streamlit interface
+src/clustering.py       Proposed clustering estimator
+src/pipeline.py         Validation, preprocessing, metrics, profiles
+src/data_generator.py   Synthetic cohort data generator
+.streamlit/config.toml   Streamlit security and upload defaults
+Dockerfile              Non-root container baseline
 ```
 
-## 3. Using the App
-- **Sidebar → Data source**: use the built-in synthetic demo data, or
-  upload your own patient CSV (select which numeric columns are the
-  clustering features, and optionally a ground-truth cohort column if
-  you have one, purely for evaluation).
-- **Sidebar → Algorithm parameters**: tune Plain K-Means (`k`), Plain
-  DBSCAN (`eps`, `min_samples`), and the Proposed method's two DBSCAN
-  stages + noise-rejection strictness.
-- Click **🚀 Run clustering**.
-- The app shows: a metrics comparison table, PCA-2D cluster plots for
-  every method side by side, a clinical cohort-profile table +
-  heatmap for the proposed method's discovered cohorts, and CSV
-  download buttons for all of the above.
+## Resume and portfolio framing
 
-## 4. The Algorithm — What Is What
-**Problem it solves:** K-Means forces every point into a cluster (one
-bad outlier can drag a centroid off target). Plain DBSCAN correctly
-flags noise, but breaks down in high-dimensional clinical feature
-space (8+ correlated features flatten density contrast — "the curse
-of dimensionality").
+**Problem:** density methods can flag outliers but may become hard to tune on correlated clinical features; centroid methods assign every point and can absorb distant records.
 
-**Pipeline (`src/clustering.py`):**
-1. **Standardize** features (`StandardScaler`).
-2. **PCA (2 components by default)** — used ONLY to give the DBSCAN
-   stages a space where "density" is geometrically meaningful again.
-   Centroids and the final K-Means step still use ALL original
-   features, so results stay in real clinical units.
-3. **Stage 1 — coarse DBSCAN** (wide `eps1`): strips gross outliers
-   from the whole population.
-4. **Stage 2 — fine DBSCAN** (tight `eps2`), run only on Stage-1
-   survivors: discovers the fine-grained patient cohorts. Running two
-   DBSCAN passes nested like this ("Nested DBSCAN") stops a handful of
-   noisy points from bridging two real clusters into one.
-5. **Centroid computation**: for each Stage-2 cluster, its mean is
-   computed in the full feature space — these become the initial
-   centroids for K-Means (instead of random/`k-means++` init).
-6. **Centroid K-Means**: run over the ENTIRE dataset (including
-   Stage-1 noise) — this "rescues" borderline noisy points into their
-   correct cohort while giving stable, repeatable cluster centers.
-7. **Noise-robust rejection**: any point still farther than
-   `mean + noise_std * std` from its assigned centroid (measured
-   against that cohort's original clean-point spread) is kept flagged
-   as noise (`-1`) rather than forced into a cohort.
+**Approach:** compare density-based cohort seeding with full-feature centroid refinement and an explicit noise flag, while keeping cohort summaries interpretable in source units.
 
-## 5. Evaluation Metrics Shown
-- **Internal** (always available): Silhouette Score, Davies-Bouldin
-  Index, Calinski-Harabasz Index.
-- **External** (only if you provide/use a ground-truth column):
-  Adjusted Rand Index (ARI), Normalized Mutual Information (NMI).
+**Engineering decisions:** input validation, missing-value handling, deterministic seeds, bounded upload size, no app-level upload persistence, a non-root container, and explicit research limitations.
 
-## 6. Tuning Tips (if clusters look wrong on your own data)
-- If the Proposed method finds **0 or 1 cohort**: `eps2` is too large
-  for your data's scale — lower it (try halving it) and/or increase
-  `pca_components`.
-- If it finds **too many tiny fragments**: raise `eps2` slightly or
-  lower `min_samples2`.
-- If **too many points are flagged noise**: raise the noise-rejection
-  strictness slider, or `eps1`.
-- A good starting point: generate a k-distance plot for your scaled
-  data (`k = min_samples`), and set `eps` near the "elbow" of the
-  sorted k-distance curve. This is standard DBSCAN tuning practice.
+**Next validation steps:** benchmark on documented public datasets, report parameter sensitivity and stability across seeds, compare against domain-reviewed labels, add privacy and threat-model review, and obtain clinical/regulatory review before any consequential use.
